@@ -71,6 +71,10 @@ class Filter:
         self.session_to_chat_id: dict[str, str] = {}
         self._set_langfuse()
 
+    def _one_line_preview(self, text: str, limit: int = 512) -> str:
+        one_line = " ".join(text.split())
+        return one_line[:limit]
+
     def _drop_keys_recursive(self, obj: Any, drop: set[str]) -> Any:
         if isinstance(obj, dict):
             out: dict[Any, Any] = {}
@@ -146,6 +150,14 @@ class Filter:
         safe_body["metadata"] = self._sanitize_debug_content(trace_metadata)
         return safe_body
 
+    def _normalize_host(self, raw: str) -> str:
+        v = (raw or "").strip().rstrip("/")
+        if not v:
+            return "https://cloud.langfuse.com"
+        if v.startswith("http://") or v.startswith("https://"):
+            return v
+        return f"https://{v}"
+
     def _set_langfuse(self) -> None:
         self.log("_set_langfuse")
         try:
@@ -194,13 +206,129 @@ class Filter:
                 self.log(f"Langfuse initialization error: {auth_error}")
                 self.langfuse = None
 
-    def _normalize_host(self, raw: str) -> str:
-        v = (raw or "").strip().rstrip("/")
-        if not v:
-            return "https://cloud.langfuse.com"
-        if v.startswith("http://") or v.startswith("https://"):
-            return v
-        return f"https://{v}"
+    def _extract_model_info(
+        self, body: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        self.log("Starting model info extraction")
+
+        model_id: str | None = None
+        model_name: str | None = None
+
+        model_item = body.get("model_item")
+        self.log(f"Model item block: {self._scrub_for_debug(model_item)}")
+        if isinstance(model_item, dict):
+            raw_item_id = model_item.get("id")
+            raw_item_name = model_item.get("name")
+            self.log(f"Model item name: {raw_item_name}, id: {raw_item_id}")
+            if isinstance(raw_item_id, str) and raw_item_id:
+                model_id = raw_item_id
+                self.log(f"Model ID set from model_item: {model_id}")
+            if isinstance(raw_item_name, str) and raw_item_name:
+                model_name = raw_item_name
+                self.log(f"Model name set from model_item: {model_name}")
+
+        raw_model = body.get("model")
+        self.log(f"Raw model at root level: {raw_model}")
+        if isinstance(raw_model, str) and raw_model and not model_id:
+            model_id = raw_model
+            self.log(f"Model ID set from root level: {model_id}")
+
+        metadata = body.get("metadata") or {}
+        meta_model = metadata.get("model")
+        self.log(f"Metadata model block: {meta_model}")
+
+        if isinstance(meta_model, dict):
+            raw_name = meta_model.get("name")
+            raw_id = meta_model.get("id")
+            self.log(f"Metadata model name: {raw_name}, id: {raw_id}")
+
+            if isinstance(raw_name, str) and raw_name and not model_name:
+                model_name = raw_name
+                self.log(f"Model name set from metadata: {model_name}")
+
+            if isinstance(raw_id, str) and raw_id and not model_id:
+                model_id = raw_id
+                self.log(f"Model ID set from metadata: {model_id}")
+                if not model_name:
+                    model_name = raw_id
+                    self.log(
+                        f"Metadata missing name, falling back to ID for name: {model_name}"
+                    )
+
+        if not model_id or not model_name:
+            task_body = metadata.get("task_body")
+            self.log(f"Looking into metadata.task_body for model info: {task_body}")
+
+            if isinstance(task_body, dict):
+                tb_model = task_body.get("model")
+                self.log(f"task_body.model: {tb_model}")
+
+                if isinstance(tb_model, str) and tb_model:
+                    if not model_id:
+                        model_id = tb_model
+                        self.log(f"Model ID set from task_body: {model_id}")
+                    if not model_name:
+                        model_name = tb_model
+                        self.log(f"Model name set from task_body: {model_name}")
+                elif isinstance(tb_model, dict):
+                    tb_id = tb_model.get("id")
+                    tb_name = tb_model.get("name")
+                    self.log(
+                        f"task_body.model.name: {tb_name}, task_body.model.id: {tb_id}"
+                    )
+
+                    if isinstance(tb_id, str) and tb_id and not model_id:
+                        model_id = tb_id
+                        self.log(f"Model ID set from task_body dict: {model_id}")
+                    if isinstance(tb_name, str) and tb_name and not model_name:
+                        model_name = tb_name
+                        self.log(f"Model name set from task_body dict: {model_name}")
+
+        self.log(f"Finished extraction model_id: {model_id}, model_name: {model_name}")
+        return model_id, model_name
+
+    def _extract_tags_from_assistant_message(self, message: str | None) -> list[str]:
+        preview = (
+            self._one_line_preview(message, 128)
+            if isinstance(message, str) and message
+            else None
+        )
+        self.log(
+            f"Attempting to extract tags from assistant message content: {preview}",
+            suppress_repeats=True,
+        )
+        if not message:
+            return []
+        text = message.strip()
+        try:
+            parsed = json.loads(text)
+        except Exception as e:
+            self.log(
+                f"Failed to parse assistant message as JSON for tags: {e}",
+                suppress_repeats=True,
+            )
+            return []
+        if not isinstance(parsed, dict):
+            return []
+        raw_tags = parsed.get("tags")
+        if not isinstance(raw_tags, list):
+            return []
+        tags: list[str] = []
+        for t in raw_tags:
+            if isinstance(t, str):
+                tags.append(t)
+        self.log(f"Extracted tags from assistant message: {tags}")
+        return tags
+
+    def _get_persistent_tags_for_chat(self, chat_id: str | None) -> list[str]:
+        if not chat_id:
+            return []
+        tags_set = self.chat_tags.get(chat_id)
+        if not tags_set:
+            return []
+        tags_list = sorted(tags_set)
+        self.log(f"Loaded persistent tags for chat_id {chat_id}: {tags_list}")
+        return tags_list
 
     def _update_persistent_tags_for_chat(
         self, chat_id: str | None, tags: list[str]
@@ -280,6 +408,26 @@ class Filter:
 
         return chat_id
 
+    def _infer_task_name_from_assistant_message(
+        self, message: str | None
+    ) -> str | None:
+        if not message:
+            return None
+        text = message.strip()
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        if "queries" in parsed:
+            return "query_generation"
+        if "title" in parsed:
+            return "title_generation"
+        if isinstance(parsed.get("tags"), list):
+            return "tags_generation"
+        return None
+
     async def inlet(
         self, body: dict[str, Any], __event_emitter__, __user__: Optional[dict] = None
     ) -> dict[str, Any]:
@@ -347,15 +495,237 @@ class Filter:
 
         return body
 
-    def outlet(self, body: dict, __user__: Optional[dict] = None) -> dict:
+    async def outlet(
+        self,
+        body: dict[str, Any],
+        __event_emitter__,
+        __user__: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         # Modify or analyze the response body after processing by the API.
         # This function is the post-processor for the API, which can be used to modify the response
         # or perform additional checks and analytics.
         #
-        self.log(f"outlet:{__name__}")
+        # print(f"GM_DEBUG - outlet:{__name__}")
         # print(f"GM_DEBUG - outlet:body:{body}")
-        # print(f"GM_INFO - outlet:user:{__user__}")
-        #
+        # print(f"GM_DEBUG - outlet:user:{__user__}")
+
+        self.log("Langfuse Filter OUTLET called")
+        self._set_langfuse()
+        if not self.langfuse:
+            self.log("[WARNING] Langfuse client not initialized - Skipped")
+            return body
+
+        if self.valves.disable_debug_bodies:
+            self.log(
+                f"Outlet function called with body summary: {self._debug_body_summary(body)}"
+            )
+        else:
+            self.log(f"Outlet function called with body: {self._scrub_for_debug(body)}")
+
+        chat_id = self._extract_chat_id(body)
+        trace_id = self._get_or_create_trace_id(chat_id)
+
+        self.log(f"outlet: chat_id={chat_id}")
+        self.log(f"outlet: trace_id={trace_id}")
+
+        metadata = body.get("metadata", {}) or {}
+
+        messages: list[dict[str, Any]] = body.get("messages") or []
+
+        self.log(f"outlet: metadata={metadata}")
+        self.log(f"outlet: messages={messages}")
+
+        assistant_index: int | None = None
+        assistant_message_obj: dict[str, Any] | None = None
+
+        for i in range(len(messages) - 1, -1, -1):
+            message = messages[i]
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                assistant_index = i
+                assistant_message_obj = message
+                break
+
+        self.log(f"outlet: assistant_index={assistant_index}")
+        self.log(f"outlet: assistant_message_obj={assistant_message_obj}")
+
+        assistant_message_text: str | None = None
+        if assistant_message_obj is not None:
+            content = assistant_message_obj.get("content")
+            if isinstance(content, str):
+                assistant_message_text = content
+            elif isinstance(content, list):
+                parts: list[str] = []
+                for c in content:
+                    if isinstance(c, dict):
+                        v = c.get("text") or c.get("content")
+                        if isinstance(v, str):
+                            parts.append(v)
+                if parts:
+                    assistant_message_text = "\n".join(parts)
+
+        self.log(f"outlet: assistant_message_text={assistant_message_text}")  # OK
+
+        task_name_raw = metadata.get("task")
+        self.log(f"outlet: task_name_raw={task_name_raw}")
+        if isinstance(task_name_raw, str) and task_name_raw:
+            task_name = task_name_raw
+        else:
+            task_name = (
+                self._infer_task_name_from_assistant_message(assistant_message_text)
+                or "llm_response"
+            )
+        self.log(f"outlet: task_name={task_name}")
+
+        tags_list: list[str] = []
+
+        self.log(f"outlet: tags_list={tags_list}")  # OK
+
+        classification_tags = self._extract_tags_from_assistant_message(
+            assistant_message_text
+        )
+        self.log(f"outlet: classification_tags={classification_tags}")  # OK
+
+        persistent_tags = self._get_persistent_tags_for_chat(chat_id)
+        self.log(f"outlet: persistent_tags={persistent_tags}")  # OK
+
+        outlet_tags_raw = body.get("tags")
+        metadata_tags_raw = metadata.get("tags")
+
+        outlet_tags = outlet_tags_raw if isinstance(outlet_tags_raw, list) else []
+        metadata_tags = metadata_tags_raw if isinstance(metadata_tags_raw, list) else []
+
+        merged_tags: list[str] = []
+        for tag in (
+            tags_list
+            + outlet_tags
+            + metadata_tags
+            + classification_tags
+            + persistent_tags
+        ):
+            if isinstance(tag, str) and tag not in merged_tags:
+                merged_tags.append(tag)
+
+        self.log(f"outlet: merged_tags={merged_tags}")  # OK
+
+        if merged_tags:
+            tags_list = merged_tags
+            self._update_persistent_tags_for_chat(chat_id, merged_tags)
+
+        prompt_messages = (
+            messages[:assistant_index] if assistant_index is not None else messages
+        )
+
+        self.log(f"outlet: prompt_messages={prompt_messages}")  # OK
+
+        usage: dict[str, Any] | None = None
+        if assistant_message_obj is not None:
+            info = assistant_message_obj.get("usage", {}) or {}
+            if isinstance(info, dict):
+                input_tokens = (
+                    info.get("prompt_eval_count")
+                    or info.get("prompt_tokens")
+                    or info.get("input_tokens")
+                )
+                output_tokens = (
+                    info.get("eval_count")
+                    or info.get("completion_tokens")
+                    or info.get("output_tokens")
+                )
+                if input_tokens is not None and output_tokens is not None:
+                    usage = {
+                        "input": input_tokens,
+                        "output": output_tokens,
+                        "unit": "TOKENS",
+                    }
+
+        user_email = __user__.get("email") if __user__ else None
+        trace_metadata = self._build_trace_metadata(dict(metadata), user_email, chat_id)
+        self.log(f"outlet: trace_metadata={trace_metadata}")  # DEBUG
+
+        safe_input = self._build_safe_input(body, trace_metadata)
+        self.log(f"outlet: safe_input={safe_input}")  # DEBUG
+
+        complete_trace_metadata = {
+            **dict(metadata),
+            "user_id": user_email,
+            "session_id": chat_id,
+            "interface": "open-webui",
+            "task": task_name,
+            "type": task_name,
+        }
+        complete_trace_metadata = self._sanitize_debug_content(complete_trace_metadata)
+        self.log(f"outlet: complete_trace_metadata={complete_trace_metadata}")  # OK
+
+        model_id, model_name = self._extract_model_info(body)
+        self.log(f"outlet: model_id={model_id}, model_name={model_name}")  # DEBUG
+
+        if self.valves.use_model_name_instead_of_id_for_generation:
+            model_value = model_name or model_id or "unknown"
+        else:
+            model_value = model_id or model_name or "unknown"
+
+        # DEBUG
+
+        try:
+            generation_metadata = {
+                **complete_trace_metadata,
+                "type": "llm_response",
+                "model_id": model_id,
+                "model_name": model_name or model_id,
+                "generation_id": str(uuid.uuid4()),
+            }
+            generation_metadata = self._sanitize_debug_content(generation_metadata)
+
+            self.log(f"outlet: generation_metadata={generation_metadata}")
+
+            generation = self.langfuse.start_generation(
+                name=f"{task_name}:{str(uuid.uuid4())}",
+                trace_context={"trace_id": trace_id},
+                model=model_value,
+                input=prompt_messages,
+                output=assistant_message_text,
+                metadata=generation_metadata,
+            )
+
+            self.log(f"outlet: generation={generation}")
+
+            try:
+                generation.update_trace(
+                    name=f"chat:{chat_id}",
+                    user_id=user_email,
+                    session_id=chat_id,
+                    tags=tags_list if tags_list else None,
+                    input=safe_input,
+                    output=assistant_message_text,
+                    metadata=complete_trace_metadata,
+                )
+                self.log(f"outlet: generation.update_trace() successful")
+            except Exception as e:
+                self.log(
+                    f"Failed to update trace via generation.update_trace (non-critical): {e}"
+                )
+
+            if usage:
+                try:
+                    generation.update(usage=usage)
+                    self.log(f"outlet: generation.update() successful")
+                except Exception as e:
+                    self.log(f"Failed to update generation usage (non-critical): {e}")
+
+            generation.end()
+            self.log(f"outlet: generation.end() successful")
+        except Exception as e:
+            self.log(f"Failed to create generation: {e}")
+
+        try:
+            if self.langfuse:
+                self.langfuse.flush()
+                self.log(f"outlet: self.langfuse.flush() successful")
+        except Exception as e:
+            self.log(f"Failed to flush Langfuse data: {e}")
+
+        # TODO
+
         self.log("outlet: END")
         # print("GM_INFO: outlet: END")
         #
